@@ -1,0 +1,8 @@
+node_modules
+run.sh
+build
+nats-
+error.log
+dev-certs
+.vscode
+nats-store

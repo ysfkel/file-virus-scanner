@@ -1,0 +1,255 @@
+#
+# User-defined substitutions:
+# _AWS_DEFAULT_REGION
+# _AWSCLI_KMS_KEY
+# _BASTION_KMS_KEY
+# _DOCKER_IMAGE
+# _ECR_URI
+# _HARBOR_PASSWORD
+# _HARBOR_USERNAME
+# _KMS_KEYRING
+# _PKS_K8S_CLUSTER_NAME
+# _PKS_K8S_MASTER_HOST
+# _PKS_K8S_MASTER_IP
+# _PKS_PASSWORD
+# _PKS_USERNAME
+
+# _BASTION_IP
+# _BASTION_USER
+
+
+timeout: 900s
+steps:  
+  ##### Start AWS Auth Preparation (Used to pull PKS image) #####
+
+  # Retrieve and decrypt the AWS CLI credentials
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        gsutil cp gs://bpaas-pipeline-configs/credentials.enc credentials.enc
+
+        gcloud kms decrypt \
+          --ciphertext-file credentials.enc \
+          --plaintext-file /aws/credentials \
+          --location global \
+          --keyring ${_KMS_KEYRING} \
+          --key ${_AWSCLI_KMS_KEY}
+    volumes:
+      - name: 'aws'
+        path: /aws
+
+  # Retrieve AWS ECR credentials
+  - name: 'mesosphere/aws-cli'
+    env: 
+      - 'AWS_SHARED_CREDENTIALS_FILE=/aws/credentials'
+      - 'AWS_DEFAULT_REGION=${_AWS_DEFAULT_REGION}'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        aws ecr get-login --no-include-email | cut  -c13- > /aws/ecr_login_arg
+    volumes:
+      - name: 'aws'
+        path: /aws
+
+  # Login to provide credentials for the pull/push
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args: ['-c', 'docker login $$(cat /aws/ecr_login_arg)']
+    volumes:
+      - name: 'aws'
+        path: /aws
+  
+  ##### End AWS Auth Preparation #####
+  
+
+  ##### Start SSH Tunnel Auth Preparation #####
+  # Retrieve and decrypt the key used to authenticate with the Bastion host
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        gsutil cp gs://bpaas-pipeline-configs/bpaas-gcb-agent.enc bpaas-gcb-agent.enc
+
+        gcloud kms decrypt \
+          --ciphertext-file bpaas-gcb-agent.enc \
+          --plaintext-file /ssh/bpaas-gcb-agent \
+          --location global \
+          --keyring ${_KMS_KEYRING} \
+          --key ${_BASTION_KMS_KEY}
+
+        chmod 400 /ssh/bpaas-gcb-agent
+    volumes:
+      - name: 'ssh'
+        path: /ssh
+  
+  ##### End SSH Tunnel Auth Preparation #####
+
+  # PKS pipeline
+
+  ########################### Configuration ###########################
+
+  # Retrieve the docker login from the remote Docker host
+  - name: ${_ECR_URI}/pks:b5fa0fe
+    entrypoint: 'bash'
+    env:
+      - '_HARBOR_USERNAME=${_HARBOR_USERNAME}'
+      - '_HARBOR_PASSWORD=${_HARBOR_PASSWORD}'
+      - '_HARBOR_HOST=${_HARBOR_HOST}'
+      - '_BASTION_IP=${_BASTION_IP}'
+      - '_BASTION_USER=${_BASTION_USER}'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        # Establish an SSH tunnel through Docker in Bastion
+        # Note: `docker login` doesn't send ANY TCP packet if the binary is called directly even if we establish a tunnel through SSH (Go figure ... Maybe no daemon?)
+
+        # Trust the Bastion host
+        echo "StrictHostKeyChecking no" >> /etc/ssh/ssh_config
+        eval `ssh-agent -s`
+        ssh-add -k /ssh/bpaas-gcb-agent
+
+        # Login through the bastion host
+        docker -H ssh://${_BASTION_USER}@${_BASTION_IP} login ${_HARBOR_HOST} -u "${_HARBOR_USERNAME}" -p "${_HARBOR_PASSWORD}"
+    volumes:
+      - name: 'ssh'
+        path: /ssh
+
+  # Retrieve the kubeconfig file for the PKS Cluster
+  - name: ${_ECR_URI}/pks:b5fa0fe
+    env:
+      - 'KUBECONFIG=/kube/config'
+      - '_BASTION_IP=${_BASTION_IP}'
+      - '_BASTION_USER=${_BASTION_USER}'
+      - '_PKS_USERNAME=${_PKS_USERNAME}'
+      - '_PKS_PASSWORD=${_PKS_PASSWORD}'
+      - '_PKS_HOST=${_PKS_HOST}'
+      - '_PKS_K8S_CLUSTER_NAME=${_PKS_K8S_CLUSTER_NAME}'
+      - '_PKS_K8S_MASTER_HOST=${_PKS_K8S_MASTER_HOST}'
+      - '_PKS_K8S_MASTER_IP=${_PKS_K8S_MASTER_IP}'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        # Establish an SSH tunnel through Bastion
+        sshuttle -e 'ssh -o StrictHostKeyChecking=no -i /ssh/bpaas-gcb-agent -4' -N -D -v --dns -l 0.0.0.0 -r ${_BASTION_USER}@${_BASTION_IP} 0.0.0.0/0
+
+        echo ${_PKS_K8S_MASTER_IP} ${_PKS_K8S_MASTER_HOST} >> /etc/hosts
+        pks login -a ${_PKS_HOST} -u ${_PKS_USERNAME} -p '${_PKS_PASSWORD}' -k
+        pks get-credentials ${_PKS_K8S_CLUSTER_NAME}
+    volumes:
+      - name: 'kube'
+        path: /kube
+      - name: 'ssh'
+        path: /ssh
+
+  ########################### Build ###########################
+
+  # Build the pipeline container image
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    env:
+      - '_BASTION_IP=${_BASTION_IP}'
+      - '_BASTION_USER=${_BASTION_USER}'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        echo "StrictHostKeyChecking no" >> /etc/ssh/ssh_config
+        eval `ssh-agent -s`
+        ssh-add -k /ssh/bpaas-gcb-agent
+        docker -H ssh://${_BASTION_USER}@${_BASTION_IP} build -t ${_DOCKER_IMAGE}:${SHORT_SHA} .
+    volumes:
+      - name: 'ssh'
+        path: /ssh
+
+  # Push the image to Harbor
+  - name: ${_ECR_URI}/pks:b5fa0fe
+    entrypoint: 'bash'
+    env:
+      - '_DOCKER_IMAGE=${_DOCKER_IMAGE}'
+      - 'SHORT_SHA=${SHORT_SHA}'
+      - '_BASTION_IP=${_BASTION_IP}'
+      - '_BASTION_USER=${_BASTION_USER}'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        echo "StrictHostKeyChecking no" >> /etc/ssh/ssh_config
+        eval `ssh-agent -s`
+        ssh-add -k /ssh/bpaas-gcb-agent
+        docker -H ssh://${_BASTION_USER}@${_BASTION_IP} push ${_DOCKER_IMAGE}:${SHORT_SHA}
+
+    volumes:
+      - name: 'ssh'
+        path: /ssh
+
+  # Deploy application to cluster
+  - name: '${_ECR_URI}/pks:b5fa0fe'
+    env:
+      - '_DOCKER_IMAGE=${_DOCKER_IMAGE}'
+      - 'KUBECONFIG=/kube/config'
+      - '_BASTION_IP=${_BASTION_IP}'
+      - '_BASTION_USER=${_BASTION_USER}'
+      - 'SHORT_SHA=${SHORT_SHA}'
+      - '_PKS_K8S_CLUSTER_NAME=${_PKS_K8S_CLUSTER_NAME}'
+      - '_PKS_K8S_MASTER_HOST=${_PKS_K8S_MASTER_HOST}'
+      - '_PKS_K8S_MASTER_IP=${_PKS_K8S_MASTER_IP}'
+
+      - '_CLAMAV_ENDPOINT=${_CLAMAV_ENDPOINT}'
+      - '_CLAMAV_PORT=${_CLAMAV_PORT}'
+      - '_MINIO_BUCKET=${_MINIO_BUCKET}'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        # Establish an SSH tunnel through Bastion to forward all traffic through it
+        sshuttle -e 'ssh -o StrictHostKeyChecking=no -i /ssh/bpaas-gcb-agent -4' -N -D -v --dns -r ${_BASTION_USER}@${_BASTION_IP} 0.0.0.0/0
+
+        echo ${_PKS_K8S_MASTER_IP} ${_PKS_K8S_MASTER_HOST} >> /etc/hosts
+        cat kubernetes/01-deployment.yml.template | envsubst > kubernetes/01-deployment-generated.yml
+        kubectl apply -f kubernetes/
+    volumes:
+      - name: 'kube'
+        path: /kube
+      - name: 'ssh'
+        path: /ssh
+
+  # Remove all pending undeleted images 
+  - name: '${_ECR_URI}/pks:b5fa0fe'
+    env:
+      - '_DOCKER_IMAGE=${_DOCKER_IMAGE}'
+      - '_BASTION_IP=${_BASTION_IP}'
+      - '_BASTION_USER=${_BASTION_USER}'
+      - 'SHORT_SHA=${SHORT_SHA}'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        # Add priv8 key to the step
+        echo "StrictHostKeyChecking no" >> /etc/ssh/ssh_config
+        eval `ssh-agent -s`
+        ssh-add -k /ssh/bpaas-gcb-agent
+        
+        # Remove the built image to release space
+        docker -H ssh://${_BASTION_USER}@${_BASTION_IP} rmi ${_DOCKER_IMAGE}:${SHORT_SHA}
+        # Remove the untagged images to release space
+        docker -H ssh://${_BASTION_USER}@${_BASTION_IP} rmi $(docker -H ssh://${_BASTION_USER}@${_BASTION_IP} images -q --filter "dangling=true") | true
+    volumes:
+      - name: 'ssh'
+        path: /ssh
+options:
+  machineType: 'N1_HIGHCPU_8'

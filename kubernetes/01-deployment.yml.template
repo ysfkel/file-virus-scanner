@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bpaas-antimalware
+  labels:
+    app: bpaas-antimalware
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bpaas-antimalware
+  template:
+    metadata:
+      labels:
+        app: bpaas-antimalware
+    spec:
+      containers:
+        - image: ${_DOCKER_IMAGE}:${SHORT_SHA}
+          name: bpaas-antimalware
+          env:
+            - name: CLAMAV_ENDPOINT
+              value: "${_CLAMAV_ENDPOINT}"
+            - name: CLAMAV_PORT
+              value: "${_CLAMAV_PORT}"
+            - name: MESSAGE_BROKER_ENDPOINT
+              value: "nats://nats.nats-io-secure"
+            - name: MESSAGE_BROKER_USE_SSLMODE
+              value: "true"
+            - name: MESSAGE_BROKER_CERTIFICATE_PATH
+              value: "/etc/nats/tls/client.crt"
+            - name: MESSAGE_BROKER_KEY_PATH
+              value: "/etc/nats/tls/client.key"
+            - name: MESSAGE_BROKER_CERTIFICATE_AUTHORITY_PATH
+              value: "/etc/nats/tls/ca.crt"
+            - name: MESSAGE_BROKER_PORT
+              value: "4222"
+            - name: MESSAGE_BROKER_CLUSTER_ID
+              value: "bpaas"
+            - name: MINIO_ENDPOINT
+              value: "minio.minio-io-secure"
+            - name: MINIO_PORT
+              value: "9000"
+            - name: MINIO_BUCKET
+              value: "${_MINIO_BUCKET}"
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secrets
+                  key: minio-access-key
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secrets
+                  key: minio-secret-key
+
+
+            # TODO: Remove this, temporary fix for SSL
+            - name: NODE_TLS_REJECT_UNAUTHORIZED
+              value: "0"
+
+          resources:
+            requests:
+              cpu: 2
+              memory: "2Gi"
+            limits:
+              cpu: 4
+              memory: "4Gi"
+          volumeMounts:
+            - name: nats-tls
+              mountPath: "/etc/nats/tls"          
+              readOnly: true
+      volumes:
+        - name: nats-tls
+          secret:
+            secretName: nats-tls
